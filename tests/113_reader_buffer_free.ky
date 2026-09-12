@@ -1,0 +1,22 @@
+// Per-connection buffer leak: PgReader allocates a ~64 KB receive buffer as a raw `ptr` field, which ARC
+// does not track -- so it leaked once per connection until close() freed it. This gate constructs a
+// connection over a dummy (invalid-fd) stream, closes it, and asserts the reader buffer was freed and
+// nulled, and that a second close is safe (no double-free). Run under --asan/--arc it also proves the free
+// path itself is clean.
+import assert;
+import list;
+import net.aio;
+import proto;
+import postgres;
+
+@test
+fn reader_buffer_freed_and_nulled_on_close() {
+    let io = aio.AsyncStream(0 - 1);          // invalid fd; we never do real I/O
+    let r = proto.PgReader(io);
+    assert.isTrue((r.buf as long) != 0);       // 64 KB buffer allocated
+    let c = postgres.PgConnection(io, r, "localhost", 5432, 0, 0);
+    c.close();
+    assert.isTrue((c.reader.buf as long) == 0); // freed + nulled
+    c.close();                                  // double close must not double-free
+    assert.isTrue((c.reader.buf as long) == 0);
+}

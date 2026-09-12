@@ -1,0 +1,18 @@
+// stmt - the server-side prepared-statement cache entry (SRP: statement identity).
+// The Parse name, the SQL (for dedup), and the RowDescription columns captured at
+// Describe time (Execute never resends them). The Parse/Bind/Execute wire frames live
+// in codec; the prepare/queryPrepared/execPrepared orchestration lives on the
+// connection (postgres.ky). This is just the cached handle model.
+import list;
+import db;
+
+pub struct PgStmt {
+    pub name: string,
+    pub sql: string,
+    pub cols: List<Column>,
+    init(name: string, sql: string, cols: List<Column>) {
+        self.name = name;
+        self.sql = sql;
+        self.cols = cols;
+    }
+}

@@ -1,0 +1,65 @@
+// T14 protocol-breadth: PostgreSQL LISTEN/NOTIFY + COPY frame decoders, gated OFFLINE against
+// hand-built byte buffers matching the pg v3 protocol (no live server). Covers:
+//   - NotificationResponse 'A': int32 pid + cstring channel + cstring payload.
+//   - CopyOutResponse 'H' header: int8 format + int16 numColumns + int16[] col formats.
+//   - CopyData 'd' extractor: the whole payload is the raw row chunk.
+import assert;
+import bytes;
+import string;
+import list;
+import db;
+import codec;
+
+fn i16b(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) % 256);
+    bytes.write_byte(p, 1, v % 256);
+    return p as string;
+}
+fn i32b(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+fn nul(): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, 0); return p as string; }
+fn cs(s: string): string { return s + nul(); }
+fn i8b(v: int): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, v % 256); return p as string; }
+
+@test
+fn test_notification_decode(): void {
+    // 'A' payload: int32 pid=1234, "chan\0", "hello\0".
+    let payload = i32b(1234) + cs("chan") + cs("hello");
+    let n = codec.decodeNotification(payload);
+    assert.equalInt(n.pid, 1234);
+    assert.equalStr(n.channel, "chan");
+    assert.equalStr(n.payload, "hello");
+}
+
+@test
+fn test_notification_empty_payload(): void {
+    // NOTIFY without a payload -> empty cstring.
+    let payload = i32b(42) + cs("events") + cs("");
+    let n = codec.decodeNotification(payload);
+    assert.equalInt(n.pid, 42);
+    assert.equalStr(n.channel, "events");
+    assert.equalStr(n.payload, "");
+}
+
+@test
+fn test_copy_response_decode(): void {
+    // 'H' CopyOutResponse header: int8 format=0, int16 numColumns=2, two int16 zero col formats.
+    let payload = i8b(0) + i16b(2) + i16b(0) + i16b(0);
+    let info = codec.decodeCopyResponse(payload);
+    assert.equalInt(info.format, 0);
+    assert.equalInt(info.columns, 2);
+}
+
+@test
+fn test_copy_data_extract(): void {
+    // 'd' CopyData: the whole payload is one raw row chunk (text copy line).
+    let chunk = "1\twidget\n";
+    assert.equalStr(codec.decodeCopyData(chunk), "1\twidget\n");
+}

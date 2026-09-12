@@ -1,0 +1,72 @@
+// auth - the authentication exchange (SRP: auth only). Owns the SCRAM-SHA-256 /
+// cleartext response to the server's Authentication ('R') messages, keeping the startup
+// handshake (postgres.ky) free of auth-mechanism detail. The auth frames themselves are
+// built by codec; this module decides WHICH to send for a given 'R' message and drives
+// the ScramClient state across the multi-message SCRAM exchange.
+import net.aio;
+import string;
+import crypto.scram;
+import crypto.random;
+import crypto.hash.md5;
+import codec;
+import proto;
+
+// `md5.md5` already returns the 32-char lowercase-hex digest, so MD5 auth composes it directly.
+
+// Build the per-connection SCRAM client. The client nonce is 36 hex chars from the
+// pure-Kyte CSPRNG (crypto/random over /dev/urandom). One instance lives across the whole
+// SCRAM exchange (client-first -> server-first -> client-final).
+pub fn newScramClient(user: string, password: string): ScramClient {
+    return ScramClient{ username: user, password: password, clientNonce: random.randomHex(18) };
+}
+
+// Respond to one Authentication ('R') message. `payload` is the full 'R' frame payload;
+// the leading i32 is the auth kind. Sends the appropriate response frame (or nothing, for
+// SASLFinal/Ok). `scram` carries state across the kind==10 -> kind==11 sequence.
+//   3  = cleartext password
+//   10 = AuthenticationSASL        -> offer SCRAM-SHA-256 (client-first)
+//   11 = AuthenticationSASLContinue -> server-first-message -> client-final
+//   12 = SASLFinal, 0 = Ok         -> nothing to send.  MD5 (5) is unsupported.
+// Returns the ServerSignature (base64) this client expects in the subsequent SASLFinal when it processes a
+// SASLContinue (kind 11); "" for every other message. The caller retains it and passes the SASLFinal
+// through `verifyServerFinal` -- the RFC 5802 mutual-authentication step that a rogue server cannot pass.
+pub async fn handleAuth(io: aio.AsyncIO, payload: string, user: string, password: string, scram: ScramClient): string {
+    let c = codec.PgCursor(payload as long, 0, payload.length);
+    let kind = c.i32();
+    if (kind == 3) {
+        let a1 = await proto.sendFrame(io, codec.buildPassword(password));
+    }
+    if (kind == 5) {
+        // AuthenticationMD5Password: 4-byte salt follows. Response = "md5" + md5hex(md5hex(pw+user)+salt).
+        let salt = c.take(4);
+        let a5 = await proto.sendFrame(io, codec.buildPassword("md5" + md5.md5(md5.md5(password + user) + salt)));
+    }
+    if (kind == 10) {
+        let a2 = await proto.sendFrame(io, codec.buildSASLInitial("SCRAM-SHA-256", scram.clientFirstMessage()));
+    }
+    if (kind == 11) {
+        let serverFirst = c.take(payload.length - 4);
+        let a3 = await proto.sendFrame(io, codec.buildSASLResponse(scram.clientFinalMessage(serverFirst)));
+        return scram.expectedServerSignature(serverFirst);
+    }
+    return "";
+}
+
+// Verify a SASLFinal ('R' kind 12) payload against the ServerSignature the client expected. Non-final
+// messages verify vacuously (return true). A kind-12 message whose `v=` does not equal `expected` means the
+// server failed mutual authentication (RFC 5802 section 5).
+pub fn verifyServerFinal(payload: string, expected: string): bool {
+    let c = codec.PgCursor(payload as long, 0, payload.length);
+    let kind = c.i32();
+    if (kind != 12) { return true; }
+    let body = c.take(payload.length - 4);
+    let got = "";
+    if (string.startsWith(body, "v=")) { got = string.slice(body, 2, body.length); }
+    return string.eql(got, expected);
+}
+
+// Whether an 'R' payload is a SASLFinal (kind 12).
+pub fn isSaslFinal(payload: string): bool {
+    let c = codec.PgCursor(payload as long, 0, payload.length);
+    return c.i32() == 12;
+}

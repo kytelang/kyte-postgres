@@ -1,0 +1,117 @@
+// proto - the async transport framing (SRP: read/write whole protocol frames off a
+// live stream). Buffered reader over an AsyncIO; the socket I/O is non-blocking - `fill`
+// awaits `io.recvInto`, which PARKS the coroutine (asio arecv) instead of blocking the
+// scheduler thread. `io` is an AsyncStream; a TLS variant (TlsStream) drops in unchanged
+// via the shared recvInto shape. Knows framing bytes only - payload MEANING lives in
+// codec.
+import net.aio;
+import bytes;
+
+pub struct PgReader {
+    pub io: aio.AsyncIO,
+    pub buf: ptr,
+    pub cap: int,
+    pub len: int,
+    pub pos: int,
+    init(io: aio.AsyncIO) {
+        self.io = io;
+        self.cap = 65536;
+        self.buf = bytes.alloc(65536);
+        self.len = 0;
+        self.pos = 0;
+    }
+}
+async fn fill(r: PgReader): bool {
+    if (r.pos > 0) {
+        // Compact unread bytes to the front. bytes.copy is memmove, so the overlapping src/dst is safe.
+        bytes.copy(r.buf as long, (r.buf as long) + (r.pos as long), r.len - r.pos);
+        r.len = r.len - r.pos;
+        r.pos = 0;
+    }
+    let space = r.cap - r.len;
+    let n = await r.io.recvInto((r.buf as long) + (r.len as long), space);   // parks the coroutine, no thread held. 64-bit addr: `as int` here TRUNCATES a >4GB heap address (mmap allocator) -> reads into a garbage pointer -> empty result.
+    if (n <= 0) { return false; }
+    r.len = r.len + n;
+    return true;
+}
+async fn need(r: PgReader, k: int): bool {
+    while (r.len - r.pos < k) { if (!(await fill(r))) { return false; } }
+    return true;
+}
+fn rbyte(r: PgReader): int { let b = bytes.read_byte(r.buf, r.pos); r.pos = r.pos + 1; return b; }
+fn ri32(r: PgReader): int {
+    let a = rbyte(r); let b = rbyte(r); let c = rbyte(r); let d = rbyte(r);
+    return ((a * 256 + b) * 256 + c) * 256 + d;
+}
+
+// A raw protocol frame: [type:byte][len:i32][payload]. `ftype == -1` = broken connection.
+// For the HOT DataRow ('D') path the payload is NOT materialised: `payload` is "" and (off,len) is a
+// view into the reader's buffer `r.buf`, which decodeDataRow reads directly before the next readFrame
+// reuses the buffer. Cold-path frames still carry a materialised `payload` string.
+pub struct PgFrame {
+    pub ftype: int,
+    pub payload: string,
+    pub off: int,
+    pub len: int,
+    init(ftype: int, payload: string, off: int, len: int) { self.ftype = ftype; self.payload = payload; self.off = off; self.len = len; }
+}
+pub async fn readFrame(r: PgReader): PgFrame {
+    if (!(await need(r, 5))) { return PgFrame(-1, "", 0, 0); }
+    let t = rbyte(r);
+    let len = ri32(r);
+    let plen = len - 4;
+    // Defensive: a corrupt/partial length (server crashed mid-stream or protocol
+    // desync) must not reach bytes.alloc - a negative or multi-GB plen segfaults the
+    // client. Treat as a broken connection; callers already handle the -1 frame.
+    if (plen < 0 || plen > 67108864) { return PgFrame(-1, "", 0, 0); }
+    if (plen > 0) {
+        if (!(await need(r, plen))) { return PgFrame(-1, "", 0, 0); }
+    }
+    let off = r.pos;
+    r.pos = r.pos + plen;
+    if (t == 68) {
+        // DataRow: ZERO-COPY. Return a view; decodeDataRow(r.buf, off, plen) reads cells straight from
+        // the reader buffer before the next readFrame compacts/refills it (the query loops decode
+        // immediately). No per-frame payload allocation on the hot path.
+        return PgFrame(t, "", off, plen);
+    }
+    // Cold-path frame (RowDescription/CommandComplete/Error/Notification/auth). Materialise the payload;
+    // bind the `as string` cast to a local so ARC owns the buffer and frees it when the frame drops.
+    let out = bytes.alloc(plen);
+    bytes.copy(out as long, (r.buf as long) + (off as long), plen);
+    let payload = out as string;
+    return PgFrame(t, payload, off, plen);
+}
+
+// SYNC frame parse: returns the next frame ONLY if it is fully buffered, WITHOUT awaiting. When the
+// frame is not yet complete it returns ftype -2 ("need more bytes") and leaves the read cursor
+// untouched, so the caller does exactly one `await fill` and retries. This removes the per-row
+// coroutine frame that `await readFrame` allocated for every DataRow: a 200-row response now parses
+// with ~4 awaits (one per socket fill) instead of ~200. Same zero-copy DataRow contract as readFrame.
+pub fn tryFrame(r: PgReader): PgFrame {
+    if (r.len - r.pos < 5) { return PgFrame(-2, "", 0, 0); }   // header not buffered yet
+    let savedPos = r.pos;
+    let t = rbyte(r);
+    let len = ri32(r);
+    let plen = len - 4;
+    if (plen < 0 || plen > 67108864) { return PgFrame(-1, "", 0, 0); }
+    if (r.len - r.pos < plen) { r.pos = savedPos; return PgFrame(-2, "", 0, 0); }   // rewind; need payload
+    let off = r.pos;
+    r.pos = r.pos + plen;
+    if (t == 68) { return PgFrame(t, "", off, plen); }   // DataRow: zero-copy view into r.buf
+    // Cold-path frame (CommandComplete/ReadyForQuery/Error/Notification). Materialise the payload;
+    // bind the `as string` cast to a local so ARC owns the buffer and frees it when the frame drops
+    // (a bare `PgFrame(t, out as string, ...)` leaks the buffer -- the cast temporary is retained by
+    // the field but never released). Mirrors readFrame.
+    let out = bytes.alloc(plen);
+    bytes.copy(out as long, (r.buf as long) + (off as long), plen);
+    let payload = out as string;
+    return PgFrame(t, payload, off, plen);
+}
+
+// Async fill exposed to the driver's sync-frame loop (fill is module-private otherwise).
+pub async fn fillReader(r: PgReader): bool { return await fill(r); }
+
+pub async fn sendFrame(io: aio.AsyncIO, frame: string): int {
+    return await io.sendStr(frame);
+}

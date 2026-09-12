@@ -1,0 +1,191 @@
+// The PostgreSQL driver's wire CODEC (data/sql/postgres.ky) - gated OFFLINE against
+// hand-built byte buffers matching the pg v3 protocol, so encode/decode is verified without
+// a live server (the driver is separately live-verified against a running PostgreSQL).
+// Covers: Startup (no type byte) + Query framing, typed RowDescription (cstring names + pg
+// OIDs) + DataRow decode incl NULL, tagged ErrorResponse, CommandComplete, param substitution.
+import assert;
+import bytes;
+import string;
+import list;
+import db;
+import codec;
+import typemap;
+
+fn i16b(v: int): string {
+    let p = bytes.alloc(2);
+    bytes.write_byte(p, 0, (v / 256) % 256);
+    bytes.write_byte(p, 1, v % 256);
+    return p as string;
+}
+fn i32b(v: int): string {
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, (v / 16777216) % 256);
+    bytes.write_byte(p, 1, (v / 65536) % 256);
+    bytes.write_byte(p, 2, (v / 256) % 256);
+    bytes.write_byte(p, 3, v % 256);
+    return p as string;
+}
+fn nul(): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, 0); return p as string; }
+fn cs(s: string): string { return s + nul(); }
+// RowDescription field: name(cstr), table_oid, col_attr, type_oid, type_size, type_mod, format.
+fn field(name: string, oid: int): string {
+    return cs(name) + i32b(0) + i16b(0) + i32b(oid) + i16b(4) + i32b(0) + i16b(0);
+}
+
+@test
+fn test_query_frame_encoding(): void {
+    // 'Q': [81][i32 len][sql\0]. sql "Q" -> cstr len 2; len = 4 + 2 = 6.
+    let f = codec.buildQuery("Q");
+    assert.equalInt(f.length, 7);       // 1 + 4 + 2
+    assert.equalInt(f[0], 81);          // 'Q'
+    assert.equalInt(f[4], 6);           // length
+    assert.equalInt(f[5], 81);          // 'Q'
+    assert.equalInt(f[6], 0);           // NUL terminator
+}
+
+@test
+fn test_startup_has_no_type_byte(): void {
+    // Startup begins with a 4-byte length (first byte 0 for any sane size), NOT a type tag,
+    // then protocol 196608 (0x00030000).
+    let s = codec.buildStartup("u", "d");
+    assert.equalInt(s[0], 0);           // high length byte
+    // bytes [4..8] = protocol version 196608 = 00 03 00 00
+    assert.equalInt(s[4], 0);
+    assert.equalInt(s[5], 3);
+    assert.equalInt(s[6], 0);
+    assert.equalInt(s[7], 0);
+}
+
+@test
+fn test_rowdesc_typed_decode(): void {
+    // id int4(23), name text(25), active bool(16).
+    let rd = i16b(3) + field("id", 23) + field("name", 25) + field("active", 16);
+    let cols = codec.decodeRowDesc(rd);
+    assert.equalInt(cols.size(), 3);
+
+    let c0 = cols.get(0) ?? Column("", DbType.Null);
+    assert.equalStr(c0.name, "id");
+    assert.isTrue(c0.type_oid == DbType.Int4);
+
+    let c1 = cols.get(1) ?? Column("", DbType.Null);
+    assert.equalStr(c1.name, "name");
+    assert.isTrue(c1.type_oid == DbType.Text);
+
+    let c2 = cols.get(2) ?? Column("", DbType.Null);
+    assert.isTrue(c2.type_oid == DbType.Bool);
+}
+
+@test
+fn test_datarow_typed_decode(): void {
+    let rd = i16b(3) + field("id", 23) + field("name", 25) + field("active", 16);
+    let cols = codec.decodeRowDesc(rd);
+
+    // Row: id=10, name="widget", active="t"  (pg bool text is t/f).
+    let dr = i16b(3) + i32b(2) + "10" + i32b(6) + "widget" + i32b(1) + "t";
+    let row = codec.decodeDataRow(dr as long, 0, dr.length, cols, false);
+    assert.equalInt(row.getInt(0), 10);
+    assert.equalStr(row.getText(1), "widget");
+    assert.isTrue(row.getBool(2));
+
+    // NULL name: id=20, name=NULL (-1), active="f".
+    let dr2 = i16b(3) + i32b(2) + "20" + i32b(4294967295) + i32b(1) + "f";
+    let row2 = codec.decodeDataRow(dr2 as long, 0, dr2.length, cols, false);
+    assert.equalInt(row2.getInt(0), 20);
+    assert.isTrue(row2.isNull(1));
+    assert.isTrue(!row2.getBool(2));
+}
+
+@test
+fn test_tag_and_error_decode(): void {
+    // CommandComplete 'C' is a single cstring.
+    assert.equalStr(codec.decodeTag(cs("INSERT 0 2")), "INSERT 0 2");
+
+    // ErrorResponse 'E': tagged cstrings ending at a 0 tag. 'S'=83, 'C'=67, 'M'=77.
+    let sev = byte83();
+    let ep = sev + cs("ERROR") + byteC() + cs("42P01") + byteM() + cs("no such table") + nul();
+    let err = codec.decodeError(ep);
+    assert.equalStr(err.code, "42P01");
+    assert.equalStr(err.message, "no such table");
+
+    // T1: a decoded ErrorResponse now rides on the result via the db interface (previously swallowed). This is
+    // exactly what query/exec set when they see an 'E' frame; the live path is otherwise unchanged.
+    let rs = db.errorResult(err);
+    assert.isTrue(rs.hasError());
+    assert.isTrue(!rs.ok());
+    assert.equalStr(rs.err.code, "42P01");
+    assert.equalStr(rs.err.message, "no such table");
+
+    let xr = db.errorExec(err);
+    assert.isTrue(xr.hasError());
+    assert.equalStr(xr.err.message, "no such table");
+
+    // A normal (successful) result carries noError() and reports ok().
+    let good = db.ResultSet();
+    assert.isTrue(good.ok());
+    assert.isTrue(!good.hasError());
+}
+fn byte83(): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, 83); return p as string; }
+fn byteC(): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, 67); return p as string; }
+fn byteM(): string { let p = bytes.alloc(1); bytes.write_byte(p, 0, 77); return p as string; }
+
+@test
+fn test_param_substitution(): void {
+    let p = List<DbValue>();
+    p.push(db.dbInt(7));
+    p.push(db.dbText("o'brien"));
+    let sql = typemap.substituteParams("INSERT INTO t VALUES ($1, $2)", p);
+    assert.equalStr(sql, "INSERT INTO t VALUES (7, 'o''brien')");
+}
+
+@test
+fn test_ssl_request_frame(): void {
+    // T2: SSLRequest is [len i32 = 8][magic 80877103 = 0x04D2162F], no type byte.
+    let f = codec.buildSSLRequest();
+    assert.equalInt(f.length, 8);
+    assert.equalInt(f[0], 0); assert.equalInt(f[1], 0); assert.equalInt(f[2], 0); assert.equalInt(f[3], 8);
+    assert.equalInt(f[4], 4); assert.equalInt(f[5], 210); assert.equalInt(f[6], 22); assert.equalInt(f[7], 47);
+}
+
+@test
+fn test_timestamp_and_bytea_decode(): void {
+    // T3: a timestamp column keeps its ISO text (not parseI64'd to the year), and bytea "\xHEX" decodes
+    // to the raw bytes. OIDs: timestamp=1114, bytea=17.
+    let rd = i16b(2) + field("ts", 1114) + field("data", 17);
+    let cols = codec.decodeRowDesc(rd);
+    let ts = "2024-01-01 12:00:00+00";
+    let bytea = "\\x48656c6c6f";                       // hex for "Hello"
+    let dr = i16b(2) + i32b(ts.length) + ts + i32b(bytea.length) + bytea;
+    let row = codec.decodeDataRow(dr as long, 0, dr.length, cols, false);
+    assert.equalStr(row.getTimestamp(0), "2024-01-01 12:00:00+00");
+    assert.equalStr(row.getText(1), "Hello");
+
+    // decodeByteaHex directly.
+    assert.equalStr(typemap.decodeByteaHex("\\x4869"), "Hi");
+}
+
+@test
+fn test_multidigit_param_and_blob(): void {
+    // T4: $10/$11/$12 must substitute the 10th/11th/12th params (single-digit-only broke the ORM's
+    // $1..$N for >9 columns). And a blob param renders a binary-safe bytea literal, not text-escaped.
+    let p = List<DbValue>();
+    let i = 0;
+    while (i < 12) { p.push(db.dbInt(i + 1)); i = i + 1; }   // params 1..12 hold values 1..12
+    let sql = typemap.substituteParams("VALUES ($1, $10, $11, $12)", p);
+    assert.equalStr(sql, "VALUES (1, 10, 11, 12)");
+
+    let pb = List<DbValue>();
+    pb.push(db.dbBlob("Hi"));                                // "Hi" = 0x48 0x69
+    assert.equalStr(typemap.substituteParams("$1", pb), "'\\x4869'");
+}
+
+@test
+fn test_cancel_request_frame(): void {
+    // T8: CancelRequest = [len i32=16][magic 80877102][pid][secret], no type byte.
+    // magic 80877102 = 0x04D2162E; pid=7 secret=99.
+    let f = codec.buildCancelRequest(7, 99);
+    assert.equalInt(f.length, 16);
+    assert.equalInt(f[3], 16);              // length
+    assert.equalInt(f[4], 4); assert.equalInt(f[5], 210); assert.equalInt(f[6], 22); assert.equalInt(f[7], 46);  // magic
+    assert.equalInt(f[11], 7);              // pid (i32 BE low byte)
+    assert.equalInt(f[15], 99);             // secret
+}

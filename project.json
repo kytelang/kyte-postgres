@@ -1,0 +1,6 @@
+{
+  "name": "kyte-postgres",
+  "version": "1.0.0",
+  "type": "library",
+  "dependencies": []
+}

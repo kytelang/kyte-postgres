@@ -1,0 +1,55 @@
+// SCRAM mutual authentication (RFC 5802): the driver now VERIFIES the server's SASLFinal ServerSignature
+// (`v=`) against the value it computed from the server-first message. This offline gate builds a SASLFinal
+// 'R' payload and checks that verifyServerFinal accepts the genuine signature and rejects a forged one --
+// the mutual-auth step that stops a rogue/MITM server from completing the handshake.
+import assert;
+import string;
+import bytes;
+import auth;
+import crypto.scram;
+
+// Build an Authentication 'R' payload: 4-byte big-endian kind, then the SASL body.
+fn buildAuthPayload(kind: int, body: string): string {
+    let n = 4 + body.length;
+    let b = bytes.alloc(n + 1);
+    bytes.write_byte(b, 0, (kind >> 24) & 255);
+    bytes.write_byte(b, 1, (kind >> 16) & 255);
+    bytes.write_byte(b, 2, (kind >> 8) & 255);
+    bytes.write_byte(b, 3, kind & 255);
+    let i = 0;
+    while (i < body.length) { bytes.write_byte(b, 4 + i, body[i]); i = i + 1; }
+    bytes.write_byte(b, n, 0);
+    bytes.write_i32(b - 4, 0, n);
+    return b as string;
+}
+
+const REAL_SIG: string = "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
+
+@test
+fn accepts_genuine_server_signature() {
+    let payload = buildAuthPayload(12, "v=" + REAL_SIG);
+    assert.isTrue(auth.isSaslFinal(payload));
+    assert.isTrue(auth.verifyServerFinal(payload, REAL_SIG));
+}
+
+@test
+fn rejects_forged_server_signature() {
+    let payload = buildAuthPayload(12, "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    assert.isTrue(auth.isSaslFinal(payload));
+    assert.isTrue(!auth.verifyServerFinal(payload, REAL_SIG));   // wrong v= -> rejected
+}
+
+@test
+fn non_final_verifies_vacuously() {
+    // A SASLContinue (kind 11) is not a final; verifyServerFinal must not reject it.
+    let payload = buildAuthPayload(11, "r=abc,s=def,i=4096");
+    assert.isTrue(!auth.isSaslFinal(payload));
+    assert.isTrue(auth.verifyServerFinal(payload, REAL_SIG));
+}
+
+@test
+fn expected_signature_matches_rfc() {
+    let c = scram.ScramClient{ username: "user", password: "pencil", clientNonce: "rOprNGfwEbeRWgbNEkqO" };
+    let sf = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    assert.equalStr(c.expectedServerSignature(sf), REAL_SIG);
+}

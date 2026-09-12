@@ -1,0 +1,604 @@
+// postgres.ky - the PostgreSQL driver INTERFACE: PgConnection (impl db.Connection) and
+// PgDriver (impl db.Driver). This module orchestrates the connection lifecycle + the
+// request/response loops; every other responsibility lives in its own module (SOLID/SRP):
+//
+//   connection      connection-string parsing        (ConnectionOptions, parse)
+//   codec    the v3 wire codec                (build* frames + decode* responses, PgCursor)
+//   typemap  OID<->DbType + value<->SQL/bind  (oidToDbType, decodeCell, substituteParams)
+//   proto    async transport framing          (PgReader, PgFrame, readFrame, sendFrame)
+//   stmt     prepared-statement cache entry   (PgStmt)
+//   auth     the SCRAM/cleartext auth exchange (newScramClient, handleAuth)
+//
+// PgConnection/PgDriver are the only names consumers touch: `import postgres; PgDriver()`.
+//
+//   let drv = PgDriver();
+//   let conn = drv.connect("postgresql://user@127.0.0.1:5432/mydb");
+//   let rs = conn.query("SELECT id, name FROM users", List<DbValue>());
+//   let id = rs.row(0).getInt(0);   // typed
+//
+// The pure halves (codec/typemap) are offline-gated; connect/query wire them to a
+// TcpStream and are live-verified against a running PostgreSQL.
+import net.aio;
+import net.asynctls;
+import io.file;
+import bytes;
+import string;
+import list;
+import db;
+import connection;
+import codec;
+import typemap;
+import datetime;
+import env;
+import collections.string_builder;
+
+// Execute('E', portal="", all rows) + Sync('S') are CONSTANT for every prepared execution -- build the two
+// frames ONCE (memoised const) instead of per query. Only the Bind frame (params) is rebuilt each call.
+const PG_EXEC_SYNC: string = codec.buildExecute("", 0) + codec.buildSync();
+import proto;
+import stmt;
+import auth;
+
+// Per-request arena control (runtime). Used to suspend the region while writing the persistent
+// prepared-statement cache so those objects are NOT reclaimed at request end. No-op when no region.
+extern("c") fn kyte_region_current(): long;
+extern("c") fn kyte_region_set(r: long): void;
+
+// --- The driver interface implementation --------------------------------------------------
+
+pub struct PgConnection impl Connection {
+    pub io: aio.AsyncIO,
+    pub reader: PgReader,
+    pub stmts: List<PgStmt>,     // per-connection prepared-statement cache
+    pub host: string,            // for CancelRequest (opens a SIDE connection to the same server)
+    pub port: int,
+    pub pid: int,                // BackendKeyData: process id + secret, needed to cancel this session
+    pub secret: int,
+    pub busy: bool,              // concurrency guard: one in-flight request per connection
+    pub notes: List<PgNotification>,  // async NOTIFYs captured off the wire during query/exec
+    pub failed: bool,            // set when connect failed closed (e.g. TLS required but refused)
+    pub failErr: string,         // the failure reason surfaced to the first query/exec
+    init(io: aio.AsyncIO, reader: PgReader, host: string, port: int, pid: int, secret: int) {
+        self.io = io;
+        self.reader = reader;
+        self.stmts = List<PgStmt>();
+        self.host = host;
+        self.port = port;
+        self.pid = pid;
+        self.secret = secret;
+        self.busy = false;
+        self.notes = List<PgNotification>();
+        self.failed = false;
+        self.failErr = "";
+    }
+    // Mark this connection dead (fail-closed at connect). The first query/exec returns the reason.
+    pub fn markFailed(self, why: string): void { self.failed = true; self.failErr = why; }
+
+    pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
+        // A connection is a single request/response channel; a second concurrent query would interleave
+        // frames and corrupt the stream. Refuse re-entry instead (use a pool for concurrency).
+        if (self.failed) { return db.errorResult(db.DbError("", self.failErr)); }
+        if (self.busy) { return db.errorResult(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        // SECURITY: when there are params, send them as SERVER-BOUND values over the extended-query
+        // protocol (Parse/Bind/Execute) instead of interpolating them into the SQL text. This makes
+        // SQL injection structurally impossible on the standard path. No-param SQL keeps the simple
+        // Query path (supports multi-statement / DDL that the extended protocol rejects).
+        let rs = if (params.size() > 0) await self.runExtended(sql, params) else await self.runSimple(sql);
+        self.busy = false;
+        return rs;
+    }
+    // Simple Query ('Q') - one round trip, no bound params. Used for no-param SQL only.
+    async fn runSimple(self, sql: string): ResultSet {
+        let sn = await proto.sendFrame(self.io, codec.buildQuery(sql));
+        let rs = ResultSet();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                    // 'Z' ReadyForQuery
+            if (f.ftype == 84) { rs.columns = codec.decodeRowDesc(f.payload); }    // 'T'
+            if (f.ftype == 68) { rs.rows.push(codec.decodeDataRow(self.reader.buf as long, f.off, f.len, rs.columns, false)); } // 'D'
+            if (f.ftype == 67) {                                             // 'C'
+                rs.tag = codec.decodeTag(f.payload);
+                rs.rows_affected = codec.tagCount(rs.tag);
+            }
+            if (f.ftype == 69) { rs.err = codec.decodeError(f.payload); }          // 'E' ErrorResponse
+            if (f.ftype == 65) { self.notes.push(codec.decodeNotification(f.payload)); } // 'A' NotificationResponse
+        }
+        return rs;
+    }
+    // Extended query on the UNNAMED statement/portal: Parse, Describe (for RowDescription), Bind the
+    // params as real protocol values, Execute all rows, Sync. Params never touch the SQL string.
+    async fn runExtended(self, sql: string, params: List<DbValue>): ResultSet {
+        let p1 = await proto.sendFrame(self.io, codec.buildParse("", sql));
+        let p2 = await proto.sendFrame(self.io, codec.buildDescribeStmt(""));
+        let p3 = await proto.sendFrame(self.io, codec.buildBind("", "", params, List<Column>(), false));
+        let p4 = await proto.sendFrame(self.io, codec.buildExecute("", 0));
+        let p5 = await proto.sendFrame(self.io, codec.buildSync());
+        let rs = ResultSet();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                    // 'Z' ReadyForQuery
+            if (f.ftype == 84) { rs.columns = codec.decodeRowDesc(f.payload); }    // 'T' RowDescription
+            if (f.ftype == 68) { rs.rows.push(codec.decodeDataRow(self.reader.buf as long, f.off, f.len, rs.columns, false)); } // 'D'
+            if (f.ftype == 67) {                                             // 'C' CommandComplete
+                rs.tag = codec.decodeTag(f.payload);
+                rs.rows_affected = codec.tagCount(rs.tag);
+            }
+            if (f.ftype == 69) { rs.err = codec.decodeError(f.payload); }          // 'E' ErrorResponse
+            if (f.ftype == 65) { self.notes.push(codec.decodeNotification(f.payload)); } // 'A'
+            // '1' ParseComplete / '2' BindComplete / 't' ParameterDescription / 'n' NoData: ignored.
+        }
+        return rs;
+    }
+
+    pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
+        if (self.failed) { return errorExec(db.DbError("", self.failErr)); }
+        if (self.busy) { return errorExec(db.DbError("", "connection busy: concurrent use")); }
+        self.busy = true;
+        // Same server-bound-param path as query() (see the SECURITY note there).
+        let rs = if (params.size() > 0) await self.runExtended(sql, params) else await self.runSimple(sql);
+        self.busy = false;
+        if (!rs.err.isEmpty()) { return errorExec(rs.err); }
+        return ExecResult(rs.rows_affected, rs.tag);
+    }
+
+    pub fn close(self): void {
+        // Sync trait method - just close the socket. A graceful Terminate would need an async send,
+        // which cannot be driven here: close is often called from INSIDE a coroutine (e.g. to cancel
+        // a timed-out query and drain its future), where a nested drive would deadlock kyte_run_root.
+        // An abrupt close is fine - the server tears the connection down.
+        self.io.close();
+        // Free the reader's ~64 KB receive buffer. It is a raw `ptr` field (not an ARC-tracked object), so
+        // nothing releases it when the connection is dropped -- without this it leaked once per connection.
+        // Null it so a double close cannot double-free.
+        if ((self.reader.buf as long) != 0) {
+            bytes.free(self.reader.buf);
+            self.reader.buf = 0 as ptr;
+        }
+    }
+
+    pub fn setTimeout(self, ms: int): int {   // async per-recv awaited deadline
+        return self.io.setTimeout(ms);
+    }
+
+    // Prepared statements (real server-side extended query). Parse + Describe the SQL once,
+    // cache the assigned name + RowDescription columns, and reuse across executions - the server
+    // parses/plans a given SQL a single time. Deduplicated: preparing the same SQL again returns
+    // the existing handle with no round-trip.
+    pub async fn prepare(self, sql: string): int {
+        let i = 0;
+        while (i < self.stmts.size()) {
+            let s = self.stmts.get(i) ?? PgStmt("", "", List<Column>());
+            if (string.eql(s.sql, sql)) { return i; }
+            i = i + 1;
+        }
+        let idx = self.stmts.size();
+        let name = `kyte_s${idx}`;
+        let s1 = await proto.sendFrame(self.io, codec.buildParse(name, sql));
+        let s2 = await proto.sendFrame(self.io, codec.buildDescribeStmt(name));
+        let s3 = await proto.sendFrame(self.io, codec.buildSync());
+        let cols = List<Column>();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                          // 'Z' ReadyForQuery
+            if (f.ftype == 84) { cols = codec.decodeRowDesc(f.payload); } // 'T' RowDescription
+            // 'E' ErrorResponse: keep draining to 'Z' so the stream stays in sync (prepare returns an
+            // int handle and has no error channel yet; query/exec surface the DbError).
+            // '1' ParseComplete / 't' ParameterDescription / 'n' NoData - nothing to capture.
+        }
+        // ESCAPE-SAFE CACHING: under the per-request arena, `name`/`sql`/`cols` were allocated in this
+        // request's region and would be freed when it completes -- but the statement cache outlives the
+        // request. Suspend the region (synchronously -- no await here) so the deep copy + the cache push
+        // (and any List grow) land in the persistent default arena, then restore. Off the web path
+        // (region == 0) this is a no-op pair around the same work.
+        let savedRegion = kyte_region_current();
+        kyte_region_set(0);
+        let pcols = List<Column>();
+        let ci = 0;
+        while (ci < cols.size()) {
+            let col = cols.get(ci) ?? Column("", DbType.Text);
+            pcols.push(Column(string.slice(col.name, 0, col.name.length), col.type_oid));
+            ci = ci + 1;
+        }
+        self.stmts.push(PgStmt(string.slice(name, 0, name.length), string.slice(sql, 0, sql.length), pcols));
+        kyte_region_set(savedRegion);
+        return idx;
+    }
+
+    pub async fn queryPrepared(self, stmt: int, params: List<DbValue>): ResultSet {
+        let rs = ResultSet();
+        if (stmt < 0 || stmt >= self.stmts.size()) { return rs; }
+        let s = self.stmts.get(stmt) ?? PgStmt("", "", List<Column>());
+        rs.columns = codec.copyColumns(s.cols);      // Execute won't resend RowDescription
+        // Prepared path: columns are already known (cached at Describe), so request BINARY result format
+        // for the fixed-width columns (isBinaryCol) -- the one path that can, since it binds after Describe.
+        let _tw0 = datetime.nowNs();
+        let s1 = await proto.sendFrame(self.io, codec.buildBind("", s.name, params, s.cols, true));
+        let s2 = await proto.sendFrame(self.io, codec.buildExecute("", 0));
+        let s3 = await proto.sendFrame(self.io, codec.buildSync());
+        let _sendNs = datetime.nowNs() - _tw0;
+        let _recvNs: long = 0;
+        let _decodeNs: long = 0;
+        let _fills = 0;
+        // SYNC-frame read loop: tryFrame parses whole buffered frames with NO await; we only park on the
+        // socket (await fillReader) when the buffer runs dry. A 200-row result now costs ~4 awaits instead
+        // of ~200, killing the per-row coroutine frame malloc that dominated the decode profile.
+        while (true) {
+            let f = proto.tryFrame(self.reader);
+            if (f.ftype == -2) {
+                let _tr = datetime.nowNs();
+                let _ok = await proto.fillReader(self.reader);
+                _recvNs = _recvNs + (datetime.nowNs() - _tr);
+                _fills = _fills + 1;
+                if (!_ok) { break; } continue;
+            } // need more bytes
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                            // 'Z'
+            if (f.ftype == 68) {
+                let _td = datetime.nowNs();
+                rs.rows.push(codec.decodeDataRow(self.reader.buf as long, f.off, f.len, rs.columns, true)); // 'D'
+                _decodeNs = _decodeNs + (datetime.nowNs() - _td);
+            }
+            if (f.ftype == 67) {
+                rs.tag = codec.decodeTag(f.payload);
+                rs.rows_affected = codec.tagCount(rs.tag);
+            }
+            if (f.ftype == 69) { rs.err = codec.decodeError(f.payload); }
+        }
+        if (string.eql(env.get("PIZZA_TIME"), "1")) {
+            console.log("    send=" + `${_sendNs / 1000}` + "us recv/wait=" + `${_recvNs / 1000}` + "us decode=" + `${_decodeNs / 1000}` + "us fills=" + `${_fills}`);
+        }
+        return rs;
+    }
+
+    // Buffer->struct path: run a prepared query and return the WHOLE response as WireRows -- every DataRow
+    // payload concatenated into ONE owned buffer, plus each row's byte offset. NO per-row Row / RawBuffer /
+    // DbValue is built (the ~400 refcounted objects a ResultSet materialises); the caller's generated
+    // `serde.bindWire<T>` decodes each column straight out of the single buffer. TEXT result format
+    // (binary=false) so the wire accessors' ASCII int/float parse applies uniformly.
+    pub async fn queryPreparedWire(self, stmt: int, params: List<DbValue>): WireRows {
+        let s = self.stmts.get(stmt) ?? PgStmt("", "", List<Column>());
+        let w = WireRows(codec.copyColumns(s.cols));
+        if (stmt < 0 || stmt >= self.stmts.size()) { return w; }
+        // ONE write: Bind (rebuilt per query for the params) + the cached constant Execute+Sync frames.
+        let _s = await proto.sendFrame(self.io, codec.buildBind("", s.name, params, s.cols, false) + PG_EXEC_SYNC);
+        let sb = string_builder.StringBuilder();
+        let pos = 0;
+        while (true) {
+            let f = proto.tryFrame(self.reader);
+            if (f.ftype == -2) { if (!(await proto.fillReader(self.reader))) { break; } continue; }
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                             // 'Z'
+            if (f.ftype == 68) {                                                       // 'D' DataRow
+                w.offs.push(pos);
+                sb.appendBytes((self.reader.buf as long) + (f.off as long), f.len);   // copy payload into the one buffer
+                pos = pos + f.len;
+            }
+        }
+        w.setBuf(sb.toString());
+        return w;
+    }
+
+    // Connection trait: the buffer->struct read. prepare() caches by SQL, so this is a cheap lookup on
+    // repeat + the direct wire fetch (no per-row objects). `db.query<T>` calls this.
+    pub async fn queryWire(self, sql: string, params: List<DbValue>): WireRows {
+        let stmt = await self.prepare(sql);
+        return await self.queryPreparedWire(stmt, params);
+    }
+
+    pub async fn execPrepared(self, stmt: int, params: List<DbValue>): ExecResult {
+        if (stmt < 0 || stmt >= self.stmts.size()) { return ExecResult(0, ""); }
+        let s = self.stmts.get(stmt) ?? PgStmt("", "", List<Column>());
+        let s1 = await proto.sendFrame(self.io, codec.buildBind("", s.name, params, s.cols, false));   // exec returns no rows
+        let s2 = await proto.sendFrame(self.io, codec.buildExecute("", 0));
+        let s3 = await proto.sendFrame(self.io, codec.buildSync());
+        let tag = "";
+        let err = noError();
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }               // 'Z'
+            if (f.ftype == 67) { tag = codec.decodeTag(f.payload); }
+            if (f.ftype == 69) { err = codec.decodeError(f.payload); }   // 'E' -- drain to 'Z'
+        }
+        if (!err.isEmpty()) { return errorExec(err); }
+        return ExecResult(codec.tagCount(tag), tag);
+    }
+
+    // Transaction control (standard SQL). exec already surfaces a DbError via .err on failure.
+    pub async fn begin(self): ExecResult { return await self.exec("BEGIN", List<DbValue>()); }
+    pub async fn commit(self): ExecResult { return await self.exec("COMMIT", List<DbValue>()); }
+    pub async fn rollback(self): ExecResult { return await self.exec("ROLLBACK", List<DbValue>()); }
+
+    // Begin a transaction at an explicit isolation level: "READ COMMITTED", "REPEATABLE READ",
+    // "SERIALIZABLE" (or "READ UNCOMMITTED", which Postgres treats as READ COMMITTED). Unblocks
+    // deadlock/serialization-retry patterns that need a stronger-than-default isolation.
+    pub async fn beginIsolation(self, level: string): ExecResult {
+        return await self.exec("BEGIN ISOLATION LEVEL " + level, List<DbValue>());
+    }
+    // Begin a read-only transaction (the planner can skip write-path bookkeeping; a good default for
+    // report/consistency reads).
+    pub async fn beginReadOnly(self): ExecResult {
+        return await self.exec("BEGIN READ ONLY", List<DbValue>());
+    }
+    // Savepoints for partial rollback within a transaction. `name` must be a valid SQL identifier.
+    pub async fn savepoint(self, name: string): ExecResult {
+        return await self.exec("SAVEPOINT " + name, List<DbValue>());
+    }
+    pub async fn rollbackTo(self, name: string): ExecResult {
+        return await self.exec("ROLLBACK TO SAVEPOINT " + name, List<DbValue>());
+    }
+    pub async fn releaseSavepoint(self, name: string): ExecResult {
+        return await self.exec("RELEASE SAVEPOINT " + name, List<DbValue>());
+    }
+
+    // --- LISTEN/NOTIFY --------------------------------------------------------
+    // Register interest in a channel. Runs `LISTEN <channel>` via the normal exec path (the
+    // server replies CommandComplete); subsequent NOTIFYs arrive as async 'A' frames, which the
+    // query/exec read loops capture into `self.notes`. Drain them with `notifications()`.
+    pub async fn listen(self, channel: string): ExecResult {
+        return await self.exec("LISTEN " + channel, List<DbValue>());
+    }
+    // Drain the notifications buffered off the wire so far (captured during any query/exec on this
+    // connection) and reset the buffer. NOTE: this returns what has ALREADY been read; a dedicated
+    // idle delivery loop that blocks awaiting the next 'A' with no query in flight is the follow-on.
+    pub fn notifications(self): List<PgNotification> {
+        let out = self.notes;
+        self.notes = List<PgNotification>();
+        return out;
+    }
+
+    // Block awaiting the NEXT notification with no query in flight (the idle delivery loop the
+    // notifications() note calls for). Returns any already-buffered NOTIFY first; otherwise reads
+    // frames off the wire until an 'A' NotificationResponse (ftype 65) arrives and decodes it. On a
+    // closed/failed transport (ftype -1) it returns an empty PgNotification so the caller can stop.
+    // Used by the web layer's LISTEN-backed SSE stream to forward events pushed by pg_notify.
+    pub async fn waitNotification(self): PgNotification {
+        if (self.notes.size() > 0) {
+            let n = self.notes.get(0) ?? codec.PgNotification(0, "", "");
+            self.notes.remove(0);
+            return n;
+        }
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { return codec.PgNotification(0, "", ""); }
+            if (f.ftype == 65) { return codec.decodeNotification(f.payload); }
+        }
+    }
+
+    // --- COPY OUT -------------------------------------------------------------
+    // Run `COPY ... TO STDOUT` and collect each 'd' CopyData chunk as a string until 'c' CopyDone,
+    // then drain 'C' CommandComplete / 'Z' ReadyForQuery. The offline gate exercises the pure
+    // decoders (decodeCopyResponse / decodeCopyData); this wires them to the live stream.
+    pub async fn copyOut(self, sql: string): List<string> {
+        let chunks = List<string>();
+        if (self.busy) { return chunks; }
+        self.busy = true;
+        let sn = await proto.sendFrame(self.io, codec.buildQuery(sql));
+        while (true) {
+            let f = await proto.readFrame(self.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                              // 'Z' ReadyForQuery
+            if (f.ftype == 100) { chunks.push(codec.decodeCopyData(f.payload)); } // 'd' CopyData
+            // 'H'(72) CopyOutResponse header, 'c'(99) CopyDone, 'C'(67) CommandComplete - nothing to collect.
+            if (f.ftype == 65) { self.notes.push(codec.decodeNotification(f.payload)); } // 'A'
+        }
+        self.busy = false;
+        return chunks;
+    }
+
+    // Cancel the query currently running on THIS session. Postgres requires this on a fresh connection
+    // (the running connection is busy), authenticated only by the (pid, secret) captured at handshake.
+    // Call from a different coroutine while a query on this connection is in flight (e.g. on a deadline).
+    pub async fn cancel(self): void {
+        if (self.pid == 0) { return; }        // no BackendKeyData -> cannot cancel
+        let side = await aio.asyncConnect(self.host, self.port);
+        let _ = await side.sendStr(codec.buildCancelRequest(self.pid, self.secret));
+        side.close();
+    }
+
+    // --- X4: true streaming via a portal --------------------------------------
+    // Stream a query's rows in server-fetched batches instead of buffering the whole set, using the
+    // extended-query protocol with a NAMED portal and Execute(maxRows). Iterate the returned cursor:
+    //   let cur = await conn.queryStream("SELECT ...", params, 500);
+    //   while (let row = await cur.next()) { ... }
+    //   let _ = await cur.close();
+    // batchSize <= 0 defaults to 100. The connection stays busy until the cursor is drained or closed.
+    pub async fn queryStream(self, sql: string, params: List<DbValue>, batchSize: int): Cursor {
+        if (self.failed) { return db.cursorOver(db.errorResult(db.DbError("", self.failErr))); }
+        if (self.busy) { return db.cursorOver(db.errorResult(db.DbError("", "connection busy: concurrent use"))); }
+        self.busy = true;
+        let bs = if (batchSize > 0) batchSize else 100;
+        let src: RowBatchSource = PgRowSource(self, sql, params, bs);
+        return Cursor(src);
+    }
+}
+
+// A lazy row source over a postgres portal: Parse+Bind+Describe+Execute(batch) on the first fetch, then
+// Execute(batch) again per fetch, WITHOUT a Sync between batches so the implicit transaction (and thus
+// the portal) stays alive. PortalSuspended ('s') means more rows; CommandComplete ('C') ends the stream,
+// at which point Sync drains to ReadyForQuery and frees the connection. Errors ('E') also finish + resync.
+pub struct PgRowSource impl RowBatchSource {
+    pub conn: PgConnection,
+    pub sql: string,
+    pub params: List<DbValue>,
+    pub portal: string,
+    pub batchSize: int,
+    pub cols: List<Column>,
+    pub started: bool,
+    pub done: bool,
+    pub e: DbError,
+    init(conn: PgConnection, sql: string, params: List<DbValue>, batchSize: int) {
+        self.conn = conn; self.sql = sql; self.params = params;
+        self.portal = "kyte_cur"; self.batchSize = batchSize;
+        self.cols = List<Column>(); self.started = false; self.done = false; self.e = noError();
+    }
+
+    async fn fetchBatch(self: PgRowSource): List<Row> {
+        let rows = List<Row>();
+        if (self.done) { return rows; }
+        if (!self.started) {
+            let _1 = await proto.sendFrame(self.conn.io, codec.buildParse("", self.sql));
+            let _2 = await proto.sendFrame(self.conn.io, codec.buildDescribeStmt(""));
+            let _3 = await proto.sendFrame(self.conn.io, codec.buildBind(self.portal, "", self.params, List<Column>(), false));
+            let _4 = await proto.sendFrame(self.conn.io, codec.buildExecute(self.portal, self.batchSize));
+            self.started = true;   // NO Sync yet: keep the portal alive across batches.
+        } else {
+            let _e = await proto.sendFrame(self.conn.io, codec.buildExecute(self.portal, self.batchSize));
+        }
+        // Flush forces the server to send this batch's responses without ending the implicit transaction
+        // (Sync would drop the portal). Without it the server holds its output and readFrame blocks.
+        let _fl = await proto.sendFrame(self.conn.io, codec.buildFlush());
+        while (true) {
+            let f = await proto.readFrame(self.conn.reader);
+            if (f.ftype == -1) { self.done = true; self.conn.busy = false; break; }   // broken connection
+            if (f.ftype == 84) { self.cols = codec.decodeRowDesc(f.payload); }         // 'T' RowDescription
+            if (f.ftype == 68) { rows.push(codec.decodeDataRow(self.conn.reader.buf as long, f.off, f.len, self.cols, false)); } // 'D' DataRow
+            if (f.ftype == 65) { self.conn.notes.push(codec.decodeNotification(f.payload)); } // 'A'
+            if (f.ftype == 115) { break; }                                            // 's' PortalSuspended -> more
+            if (f.ftype == 67) { await self.finish(); break; }                        // 'C' CommandComplete -> done
+            if (f.ftype == 69) { self.e = codec.decodeError(f.payload); await self.finish(); break; } // 'E'
+            // '1' ParseComplete / '2' BindComplete / 't' ParameterDescription / 'n' NoData -> ignore.
+        }
+        return rows;
+    }
+
+    // End the extended-query sequence: Sync, drain to ReadyForQuery (this also closes the portal), mark
+    // done and release the connection.
+    async fn finish(self: PgRowSource): void {
+        if (self.done) { return; }
+        let _s = await proto.sendFrame(self.conn.io, codec.buildSync());
+        while (true) {
+            let f = await proto.readFrame(self.conn.reader);
+            if (f.ftype == -1) { break; }
+            if (f.ftype == 90) { break; }                                             // 'Z' ReadyForQuery
+            if (f.ftype == 69 && self.e.isEmpty()) { self.e = codec.decodeError(f.payload); }
+        }
+        self.done = true;
+        self.conn.busy = false;
+    }
+
+    fn columns(self: PgRowSource): List<Column> { return self.cols; }
+    fn err(self: PgRowSource): DbError { return self.e; }
+    async fn close(self: PgRowSource): void { if (!self.done) { await self.finish(); } }
+}
+
+/// Connect and return the CONCRETE PgConnection (so callers can reach queryStream and the pg-specific
+/// helpers: listen/notifications/copyOut/cancel). Driver.connect returns the Connection trait; this is
+/// the postgres analogue of mongodb.open.
+pub async fn open(connectionString: string): PgConnection {
+    return await pgConnectAsync(connectionString);
+}
+
+/// The PostgreSQL driver. connection string: `postgresql://user@host:port/database` (password optional
+/// as `user:password@`). Handles the startup handshake incl. AuthenticationOk / Cleartext /
+/// SCRAM-SHA-256, then reads ParameterStatus/BackendKeyData until ReadyForQuery.
+// The whole connect + startup handshake as ONE async fn (one await-chain, driven once by the
+// synchronous Driver.connect). Every socket op parks the coroutine; a single drive pumps the
+// asio io_context through the entire handshake.
+async fn pgConnectAsync(connectionString: string): PgConnection {
+    let d = connection.parse(connectionString);
+    let base = await aio.asyncConnectDeadline(d.host, d.port, connection.connectTimeoutMs(connectionString));
+    if (!base.ok()) {
+        let dead = PgConnection(base, PgReader(base), d.host, d.port, 0, 0);
+        dead.markFailed("postgres: connect timed out or refused: " + d.host + ":" + `${d.port}`);
+        return dead;
+    }
+
+    // sslmode=disable (default): plaintext, unchanged path.
+    if (string.eql(d.sslmode, "disable")) {
+        return await pgStartup(base, d);
+    }
+
+    // STARTTLS: send SSLRequest and read the single-byte reply ('S' supported / 'N' refused).
+    let _sr = await base.sendStr(codec.buildSSLRequest());
+    let rb = bytes.alloc(1);
+    let rn = await base.recvInto(rb as long, 1);
+    let sslByte = if (rn > 0) bytes.read_byte(rb, 0) else 0;
+    bytes.free(rb);
+
+    if (sslByte == 83) {   // 'S' - upgrade this socket to TLS (handshake bounded by connect_timeout)
+        let toMs = connection.connectTimeoutMs(connectionString);
+        if (string.eql(d.sslmode, "verify-full") || string.eql(d.sslmode, "verify-ca")) {
+            let caPem = if (d.sslrootcert != "") File.readText(d.sslrootcert) else "";
+            let ts = await asynctls.tlsClientUpgradeVerifyDeadline(base, d.host, caPem, toMs);
+            return await pgStartup(ts, d);
+        }
+        let ts2 = await asynctls.tlsClientUpgradeDeadline(base, d.host, toMs);
+        return await pgStartup(ts2, d);
+    }
+    // 'N': the server refused TLS. Fail CLOSED when the sslmode mandates encryption -- continuing in
+    // plaintext would let a MITM that strips the SSLRequest silently downgrade a require/verify client.
+    // Only disable/prefer/allow may fall back to plaintext.
+    if (string.eql(d.sslmode, "require") || string.eql(d.sslmode, "verify-ca") || string.eql(d.sslmode, "verify-full")) {
+        let dead = PgConnection(base, PgReader(base), d.host, d.port, 0, 0);
+        dead.markFailed("postgres: sslmode=" + d.sslmode + " requires TLS but the server refused it");
+        return dead;
+    }
+    return await pgStartup(base, d);
+}
+
+// Run the Postgres startup + auth handshake over `io` (plaintext AsyncStream or an upgraded TlsStream,
+// both AsyncIO). Passing the concrete stream into this AsyncIO param is a widening, the safe direction.
+async fn pgStartup(io: aio.AsyncIO, d: ConnectionOptions): PgConnection {
+    let reader = PgReader(io);
+    let sn = await proto.sendFrame(io, codec.buildStartup(d.user, d.database));
+
+    // A SCRAM-SHA-256 exchange spans several 'R' messages, so the ScramClient (holding
+    // username/password/client-nonce) lives across the loop. Auth-mechanism detail is in auth.
+    let scram = auth.newScramClient(d.user, d.password);
+
+    let pid = 0;
+    let secret = 0;
+    // SCRAM mutual auth (RFC 5802): remember the ServerSignature we expect, and refuse to finish the
+    // handshake unless the server proves it knows the password. `scramUsed` is set when we start SCRAM;
+    // `scramVerified` only when a SASLFinal's `v=` matches -- so a rogue server that skips or forges the
+    // final is rejected, not silently trusted.
+    let expectedServerSig = "";
+    let scramUsed = false;
+    let scramVerified = false;
+    while (true) {
+        let f = await proto.readFrame(reader);
+        if (f.ftype == -1) { break; }
+        if (f.ftype == 90) { break; }   // 'Z' ReadyForQuery - handshake done
+        if (f.ftype == 75) {            // 'K' BackendKeyData: capture pid + secret for CancelRequest
+            let kc = codec.PgCursor(f.payload as long, 0, f.payload.length);
+            pid = kc.i32();
+            secret = kc.i32();
+        }
+        if (f.ftype == 82) {            // 'R' Authentication - delegate to auth
+            // Verify a SASLFinal against the signature we computed at SASLContinue.
+            if (scramUsed && auth.isSaslFinal(f.payload)) {
+                if (!auth.verifyServerFinal(f.payload, expectedServerSig)) {
+                    io.close();
+                    kyte_panic("postgres: SCRAM server signature mismatch (rogue/MITM server) -- refusing connection");
+                }
+                scramVerified = true;
+            }
+            let sig = await auth.handleAuth(io, f.payload, d.user, d.password, scram);
+            if (sig.length > 0) { expectedServerSig = sig; scramUsed = true; }
+        }
+        if (f.ftype == 69) {            // 'E' ErrorResponse during startup
+            break;
+        }
+    }
+    // Fail closed: if we did SCRAM but never verified the server's signature (e.g. the server jumped straight
+    // to ReadyForQuery), the mutual-auth guarantee is absent -- reject rather than trust.
+    if (scramUsed && !scramVerified) {
+        io.close();
+        kyte_panic("postgres: SCRAM completed without a verified server signature -- refusing connection");
+    }
+    return PgConnection(io, reader, d.host, d.port, pid, secret);
+}
+
+pub struct PgDriver impl Driver {
+    pub async fn connect(self, connectionString: string): Connection {
+        // connect is a synchronous trait method: it DRIVES the async connect + handshake to
+        // completion (a one-time setup cost, one drive). The resulting connection's query/exec
+        // are async and PARK - that is where the non-blocking benefit lands.
+        return await pgConnectAsync(connectionString);
+    }
+}
